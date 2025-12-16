@@ -83,7 +83,7 @@ _I18N: Dict[Lang, Dict[str, str]] = {
         "fetching": "Fetching data...",
         "fetching_bench": "Fetching benchmark: {bench}",
         "fetching_syms": "Fetching {n} symbols...",
-        "done": "เสร็จแล้ว.",
+        "done": "Done.",
         "benchmark_error": "Benchmark error: {err}",
         "no_symbols_computed": "No symbols could be computed (check Errors tab).",
         "breadth_title": "Market Breadth",
@@ -989,38 +989,44 @@ def main() -> None:
         )
 
         with tab_data:
-            st.caption("Change settings, then click Fetch to avoid request limits." if lang == "en" else "เปลี่ยนค่าตามต้องการ แล้วกดดึงข้อมูลเพื่อลดการชน rate limit")
+            st.caption(
+                "Change settings, then click Fetch to avoid request limits."
+                if lang == "en"
+                else "เปลี่ยนค่าตามต้องการ แล้วกดดึงข้อมูลเพื่อลดการชน rate limit"
+            )
             with st.form("data_form", clear_on_submit=False):
-                raw_symbols = st.text_area(
-                    _t("symbols", lang=lang),
-                    value=cfg.default_symbols,
-                    height=220,
-                    help=_t("symbols_help", lang=lang),
+                # ใช้ชุดสัญลักษณ์เริ่มต้นจากระบบ ไม่ให้แก้ไขใน UI
+                st.caption(
+                    "Universe: ใช้ชุดหุ้นค่าเริ่มต้นที่กำหนดในระบบ"
+                    if lang == "th"
+                    else "Universe: using the default symbol list defined in the app."
                 )
-                benchmark_raw = st.text_input(_t("benchmark", lang=lang), value=cfg.default_benchmark)
+
+                benchmark_raw = st.text_input(
+                    _t("benchmark", lang=lang),
+                    value=cfg.default_benchmark,
+                )
                 tf_label = st.selectbox(
                     _t("timeframe", lang=lang),
                     options=["Daily", "Weekly"],
                     index=0,
                     help=_t("timeframe_help", lang=lang),
                 )
-                bars = st.number_input(_t("bars", lang=lang), min_value=120, max_value=3000, value=cfg.default_bars, step=10)
-                ttl_hours = st.selectbox(
-                    _t("cache_ttl", lang=lang),
-                    options=[1, 3, 6, 12, 24],
-                    index=[1, 3, 6, 12, 24].index(cfg.default_cache_ttl_hours),
+                bars = st.number_input(
+                    _t("bars", lang=lang),
+                    min_value=120,
+                    max_value=3000,
+                    value=cfg.default_bars,
+                    step=10,
                 )
-                max_workers = st.slider(
-                    _t("fetch_workers", lang=lang),
-                    min_value=1,
-                    max_value=10,
-                    value=cfg.default_workers,
-                    step=1,
-                    help=_t("fetch_workers_help", lang=lang),
-                )
+
+                # TTL / workers ใช้ค่าคงที่จาก AppConfig ไม่ต้องให้ user ตั้ง
                 force_refresh = st.toggle(_t("force_refresh", lang=lang), value=False)
 
-                fetch_clicked = st.form_submit_button(_t("fetch_btn", lang=lang), type="primary")
+                fetch_clicked = st.form_submit_button(
+                    _t("fetch_btn", lang=lang),
+                    type="primary",
+                )
 
             last_bundle = st.session_state.get("data_bundle")
             if last_bundle:
@@ -1041,8 +1047,11 @@ def main() -> None:
             st.markdown(_t("visual_quick_guide", lang=lang))
 
             fixed_span: Optional[float] = None
-            scale_col, metric_col, tail_col = st.columns([2, 2, 1])
-            with scale_col:
+            col_scale, col_rank, col_anim = st.columns(3)
+
+            # ซ้าย: Scale
+            with col_scale:
+                st.subheader("Scale" if lang == "en" else "สเกลกราฟ")
                 auto_range = st.toggle(_t("auto_scale", lang=lang), value=True)
                 if not auto_range:
                     fixed_span = float(
@@ -1056,7 +1065,9 @@ def main() -> None:
                         )
                     )
 
-            with metric_col:
+            # กลาง: การจัดลำดับจุด
+            with col_rank:
+                st.subheader("Ranking" if lang == "en" else "การจัดลำดับ")
                 metric_ui = st.selectbox(
                     _t("metric_sort", lang=lang),
                     options=["Speed", "Distance"],
@@ -1081,15 +1092,18 @@ def main() -> None:
                     )
                 )
 
+            # ขวา: หาง + อนิเมชัน
             animation_window = 365
             animation_step = 1
-            with tail_col:
+            with col_anim:
+                st.subheader("Tails & Animation" if lang == "en" else "หาง & อนิเมชัน")
                 st.markdown(_t("tails_heading", lang=lang))
                 show_tails_top = st.toggle(
                     _t("show_tails_topn", lang=lang),
                     value=True,
                     help=_t("show_tails_topn_help", lang=lang),
                 )
+
                 st.markdown(_t("animation_heading", lang=lang))
                 animate_rrg = st.checkbox(
                     _t("animate_timeline", lang=lang),
@@ -1112,6 +1126,7 @@ def main() -> None:
                     step=1,
                     help=_t("frame_step_help", lang=lang),
                 )
+
             label_mode_ui = "Highlighted"
             tail_mode_ui = "Highlighted" if show_tails_top else "None"
 
@@ -1270,11 +1285,17 @@ def main() -> None:
             st.session_state["public_link_modal"] = False
 
     if fetch_clicked:
-        symbols_raw = parse_symbol_list(raw_symbols)
+        # ใช้ default_symbols จาก config แทน input user
+        symbols_raw = parse_symbol_list(cfg.default_symbols)
         symbols = [format_set_symbol(s) for s in symbols_raw]
-        benchmark = format_set_symbol(benchmark_raw) if ":" not in benchmark_raw else benchmark_raw.strip().upper()
+        benchmark = (
+            format_set_symbol(benchmark_raw)
+            if ":" not in benchmark_raw
+            else benchmark_raw.strip().upper()
+        )
         resolution = resolution_from_label(tf_label)
-        ttl_seconds = int(ttl_hours) * 3600
+        # TTL fix ตามค่า default ใน AppConfig
+        ttl_seconds = int(cfg.default_cache_ttl_hours) * 3600
 
         if not symbols:
             st.error(_t("no_symbols", lang=lang))
@@ -1292,7 +1313,13 @@ def main() -> None:
                 refresh=bool(force_refresh),
             )
             if bench_err or bench_df is None:
-                st.error(_t("benchmark_error", lang=lang, err=(bench_err or "Unknown error")))
+                st.error(
+                    _t(
+                        "benchmark_error",
+                        lang=lang,
+                        err=(bench_err or "Unknown error"),
+                    )
+                )
                 return
 
             bench_close = _align_close(bench_df)
@@ -1304,7 +1331,9 @@ def main() -> None:
             errors: Dict[str, str] = {}
 
             status.update(label=_t("fetching_syms", lang=lang, n=len(symbols)))
-            with futures.ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
+            # จำนวน workers คงที่ เพื่อลดโอกาสชน rate limit
+            safe_workers = 3
+            with futures.ThreadPoolExecutor(max_workers=safe_workers) as ex:
                 jobs = [
                     ex.submit(
                         _fetch_one,
@@ -1349,7 +1378,7 @@ def main() -> None:
             "ohlcv": ohlcv,
             "errors": errors,
             "fetched_at": time.time(),
-            "ttl_hours": int(ttl_hours),
+            "ttl_hours": int(cfg.default_cache_ttl_hours),
         }
         st.session_state["data_gen"] = int(st.session_state.get("data_gen", 0)) + 1
         st.session_state.pop("rrg_key", None)
