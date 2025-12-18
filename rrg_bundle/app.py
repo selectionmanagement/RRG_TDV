@@ -715,6 +715,142 @@ def _compute_breadth_new_high_low(
     )
 
 
+def _compute_breadth_symbol_flags(
+    *,
+    closes: Dict[str, pd.Series],
+    ohlcv: Dict[str, pd.DataFrame],
+    asof: pd.Timestamp,
+    window_bars: int,
+) -> pd.DataFrame:
+    asof_ts = pd.Timestamp(asof)
+    window_bars = max(2, int(window_bars))
+
+    rows: List[dict] = []
+    for sym, close in closes.items():
+        if close is None or close.empty:
+            continue
+
+        s_close = close.astype(float).copy()
+        s_close.index = pd.to_datetime(s_close.index, errors="coerce")
+        s_close = s_close[~s_close.index.isna()]
+        s_close = s_close[~s_close.index.duplicated(keep="last")].sort_index()
+        if s_close.empty:
+            continue
+
+        try:
+            cutoff = _cutoff_for_index(asof_ts, s_close.index)
+            close_up_to = s_close.loc[:cutoff]
+        except Exception:
+            close_up_to = s_close
+        if close_up_to.empty:
+            close_up_to = s_close
+
+        last_idx = close_up_to.index[-1]
+        last_close = float(close_up_to.iloc[-1])
+        last_dt = _to_naive_timestamp(pd.Timestamp(last_idx))
+
+        ema20 = s_close.ewm(span=20, adjust=False).mean()
+        ema50 = s_close.ewm(span=50, adjust=False).mean()
+        ema200 = s_close.ewm(span=200, adjust=False).mean()
+        ema_20 = float(ema20.loc[last_idx])
+        ema_50 = float(ema50.loc[last_idx])
+        ema_200 = float(ema200.loc[last_idx])
+
+        above_ema20 = bool(last_close > ema_20) if pd.notna(ema_20) else False
+        above_ema50 = bool(last_close > ema_50) if pd.notna(ema_50) else False
+        above_ema200 = bool(last_close > ema_200) if pd.notna(ema_200) else False
+
+        df = ohlcv.get(sym)
+        new_high_flag: object = pd.NA
+        new_low_flag: object = pd.NA
+        high_last: object = pd.NA
+        low_last: object = pd.NA
+        high_date: object = pd.NA
+        low_date: object = pd.NA
+        prev_high_max: object = pd.NA
+        prev_low_min: object = pd.NA
+        if df is not None and not df.empty and "high" in df.columns and "low" in df.columns:
+            idx = pd.to_datetime(df.index)
+            idx = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+            high = pd.Series(df["high"].to_numpy(), index=idx).astype(float).sort_index()
+            low = pd.Series(df["low"].to_numpy(), index=idx).astype(float).sort_index()
+
+            high = high.loc[:_to_naive_timestamp(asof_ts)]
+            low = low.loc[:_to_naive_timestamp(asof_ts)]
+            if not high.empty and not low.empty:
+                prev_max = high.rolling(window_bars, min_periods=window_bars).max().shift(1)
+                prev_min = low.rolling(window_bars, min_periods=window_bars).min().shift(1)
+                h_last = float(high.iloc[-1])
+                l_last = float(low.iloc[-1])
+                pmax = prev_max.iloc[-1]
+                pmin = prev_min.iloc[-1]
+
+                high_last = h_last
+                low_last = l_last
+                high_date = _to_naive_timestamp(pd.Timestamp(high.index[-1])).date().isoformat()
+                low_date = _to_naive_timestamp(pd.Timestamp(low.index[-1])).date().isoformat()
+                prev_high_max = pd.NA if pd.isna(pmax) else float(pmax)
+                prev_low_min = pd.NA if pd.isna(pmin) else float(pmin)
+
+                new_high_flag = pd.NA if pd.isna(pmax) else bool(h_last > float(pmax))
+                new_low_flag = pd.NA if pd.isna(pmin) else bool(l_last < float(pmin))
+
+        def _pct_over(ref: object) -> object:
+            try:
+                r = float(ref)  # type: ignore[arg-type]
+            except Exception:
+                return pd.NA
+            if not pd.notna(r) or r == 0.0:
+                return pd.NA
+            return (last_close / r - 1.0) * 100.0
+
+        def _pct_break(v: object, ref: object) -> object:
+            try:
+                vv = float(v)  # type: ignore[arg-type]
+                rr = float(ref)  # type: ignore[arg-type]
+            except Exception:
+                return pd.NA
+            if not pd.notna(vv) or not pd.notna(rr) or rr == 0.0:
+                return pd.NA
+            return (vv / rr - 1.0) * 100.0
+
+        rows.append(
+            {
+                "symbol": sym,
+                "ticker": short_symbol(sym),
+                "date": last_dt.date().isoformat(),
+                "last_close": last_close,
+                "above_ema20": above_ema20,
+                "above_ema50": above_ema50,
+                "above_ema200": above_ema200,
+                "ema20_value": ema_20,
+                "ema50_value": ema_50,
+                "ema200_value": ema_200,
+                "close_vs_ema20_pct": _pct_over(ema_20),
+                "close_vs_ema50_pct": _pct_over(ema_50),
+                "close_vs_ema200_pct": _pct_over(ema_200),
+                "new_high": new_high_flag,
+                "new_low": new_low_flag,
+                "high_date": high_date,
+                "high_last": high_last,
+                "prev_high_max": prev_high_max,
+                "high_breakout_pct": _pct_break(high_last, prev_high_max),
+                "low_date": low_date,
+                "low_last": low_last,
+                "prev_low_min": prev_low_min,
+                "low_breakout_pct": _pct_break(low_last, prev_low_min),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).set_index("symbol")
+    out["new_high"] = out["new_high"].astype("boolean")
+    out["new_low"] = out["new_low"].astype("boolean")
+    return out
+
+
 def _cutoff_for_index(cutoff: pd.Timestamp, idx: pd.Index) -> pd.Timestamp:
     cutoff = pd.Timestamp(cutoff)
     tz = getattr(idx, "tz", None)
@@ -1653,6 +1789,23 @@ def main() -> None:
         fifty_two_week_low_df = pd.DataFrame(rows_52w_low).set_index("symbol") if rows_52w_low else pd.DataFrame()
         fifty_two_low_cache[fifty_two_low_key] = fifty_two_week_low_df
 
+    # Per-symbol breadth flags (for Snapshot)
+    breadth_symbols_cache = st.session_state.setdefault("breadth_symbols_cache", {})
+    window_bars = _breadth_window_bars(str(data_bundle.get("tf_label") or "Daily"))
+    breadth_symbols_key = (data_gen, tuple(symbols), str(ref_ts_naive.date()), int(window_bars))
+    breadth_symbols_df = breadth_symbols_cache.get(breadth_symbols_key)
+    if (
+        breadth_symbols_df is None
+        or (isinstance(breadth_symbols_df, pd.DataFrame) and breadth_symbols_df.empty)
+    ):
+        breadth_symbols_df = _compute_breadth_symbol_flags(
+            closes=closes,
+            ohlcv=ohlcv,
+            asof=pd.Timestamp(ref_ts),
+            window_bars=window_bars,
+        )
+        breadth_symbols_cache[breadth_symbols_key] = breadth_symbols_df
+
     tab_chart, tab_table, tab_breadth, tab_errors = st.tabs(
         [
             _t("main_tab_rrg", lang=lang),
@@ -1805,6 +1958,179 @@ def main() -> None:
             file_name=f"rrg_{str(data_bundle['tf_label']).lower()}.csv",
             mime="text/csv",
         )
+
+        with st.expander("Market Breadth - Passing symbols" if lang == "en" else "Market Breadth - รายชื่อหุ้นที่เข้าเงื่อนไข", expanded=False):
+            if breadth_symbols_df is None or not isinstance(breadth_symbols_df, pd.DataFrame) or breadth_symbols_df.empty:
+                st.info("No breadth symbol flags available." if lang == "en" else "ไม่มีข้อมูลรายชื่อหุ้นจาก Market Breadth")
+            else:
+                tab_labels = (
+                    ["All", "Above EMA20", "Above EMA50", "Above EMA200", "New highs", "New lows"]
+                    if lang == "en"
+                    else ["ทั้งหมด", "เหนือ EMA20", "เหนือ EMA50", "เหนือ EMA200", "ทำจุดสูงสุดใหม่", "ทำจุดต่ำสุดใหม่"]
+                )
+                modes = ["all", "ema20", "ema50", "ema200", "new_high", "new_low"]
+                tabs_b = st.tabs(tab_labels)
+
+                for t, mode in zip(tabs_b, modes):
+                    with t:
+                        df_show = breadth_symbols_df.copy()
+                        if mode == "ema20":
+                            df_show = df_show[df_show["above_ema20"] == True]  # noqa: E712
+                        elif mode == "ema50":
+                            df_show = df_show[df_show["above_ema50"] == True]  # noqa: E712
+                        elif mode == "ema200":
+                            df_show = df_show[df_show["above_ema200"] == True]  # noqa: E712
+                        elif mode == "new_high":
+                            df_show = df_show[df_show["new_high"].fillna(False) == True]  # noqa: E712
+                        elif mode == "new_low":
+                            df_show = df_show[df_show["new_low"].fillna(False) == True]  # noqa: E712
+
+                        if lang == "en":
+                            st.caption(f"Symbols: {len(df_show)} | As of: {str(ref_ts_naive.date())}")
+                        else:
+                            st.caption(f"จำนวนหุ้น: {len(df_show)} | อ้างอิงถึง: {str(ref_ts_naive.date())}")
+                        if lang == "en":
+                            if mode == "ema20":
+                                st.caption("Reference: pass if last_close > EMA20 (compare `last_close` vs `ema20_value`).")
+                            elif mode == "ema50":
+                                st.caption("Reference: pass if last_close > EMA50 (compare `last_close` vs `ema50_value`).")
+                            elif mode == "ema200":
+                                st.caption("Reference: pass if last_close > EMA200 (compare `last_close` vs `ema200_value`).")
+                            elif mode == "new_high":
+                                st.caption(
+                                    f"Reference: pass if `high_last` breaks above `prev_high_max` "
+                                    f"(previous {window_bars}-bar max)."
+                                )
+                            elif mode == "new_low":
+                                st.caption(
+                                    f"Reference: pass if `low_last` breaks below `prev_low_min` "
+                                    f"(previous {window_bars}-bar min)."
+                                )
+                        else:
+                            if mode == "ema20":
+                                st.caption("จุดอ้างอิง: ผ่านเกณฑ์เมื่อ last_close > EMA20 (เทียบ `last_close` กับ `ema20_value`)")
+                            elif mode == "ema50":
+                                st.caption("จุดอ้างอิง: ผ่านเกณฑ์เมื่อ last_close > EMA50 (เทียบ `last_close` กับ `ema50_value`)")
+                            elif mode == "ema200":
+                                st.caption("จุดอ้างอิง: ผ่านเกณฑ์เมื่อ last_close > EMA200 (เทียบ `last_close` กับ `ema200_value`)")
+                            elif mode == "new_high":
+                                st.caption(
+                                    f"จุดอ้างอิง: ผ่านเกณฑ์เมื่อ `high_last` ทะลุ `prev_high_max` "
+                                    f"(ค่าสูงสุด {window_bars} แท่งก่อนหน้า)"
+                                )
+                            elif mode == "new_low":
+                                st.caption(
+                                    f"จุดอ้างอิง: ผ่านเกณฑ์เมื่อ `low_last` หลุด `prev_low_min` "
+                                    f"(ค่าต่ำสุด {window_bars} แท่งก่อนหน้า)"
+                                )
+
+                        df_show = df_show.reset_index().sort_values(["date", "ticker"], ascending=[False, True])
+
+                        base_number_cols = {
+                            "last_close": st.column_config.NumberColumn(format="%.2f"),
+                            "ema20_value": st.column_config.NumberColumn(format="%.2f"),
+                            "ema50_value": st.column_config.NumberColumn(format="%.2f"),
+                            "ema200_value": st.column_config.NumberColumn(format="%.2f"),
+                            "close_vs_ema20_pct": st.column_config.NumberColumn(format="%.2f"),
+                            "close_vs_ema50_pct": st.column_config.NumberColumn(format="%.2f"),
+                            "close_vs_ema200_pct": st.column_config.NumberColumn(format="%.2f"),
+                            "high_last": st.column_config.NumberColumn(format="%.2f"),
+                            "prev_high_max": st.column_config.NumberColumn(format="%.2f"),
+                            "high_breakout_pct": st.column_config.NumberColumn(format="%.2f"),
+                            "low_last": st.column_config.NumberColumn(format="%.2f"),
+                            "prev_low_min": st.column_config.NumberColumn(format="%.2f"),
+                            "low_breakout_pct": st.column_config.NumberColumn(format="%.2f"),
+                        }
+
+                        if mode == "ema20":
+                            show_cols = [
+                                "symbol",
+                                "ticker",
+                                "date",
+                                "last_close",
+                                "ema20_value",
+                                "close_vs_ema20_pct",
+                            ]
+                        elif mode == "ema50":
+                            show_cols = [
+                                "symbol",
+                                "ticker",
+                                "date",
+                                "last_close",
+                                "ema50_value",
+                                "close_vs_ema50_pct",
+                            ]
+                        elif mode == "ema200":
+                            show_cols = [
+                                "symbol",
+                                "ticker",
+                                "date",
+                                "last_close",
+                                "ema200_value",
+                                "close_vs_ema200_pct",
+                            ]
+                        elif mode == "new_high":
+                            show_cols = [
+                                "symbol",
+                                "ticker",
+                                "high_date",
+                                "high_last",
+                                "prev_high_max",
+                                "high_breakout_pct",
+                                "last_close",
+                                "date",
+                            ]
+                        elif mode == "new_low":
+                            show_cols = [
+                                "symbol",
+                                "ticker",
+                                "low_date",
+                                "low_last",
+                                "prev_low_min",
+                                "low_breakout_pct",
+                                "last_close",
+                                "date",
+                            ]
+                        else:
+                            show_cols = [
+                                "symbol",
+                                "ticker",
+                                "date",
+                                "last_close",
+                                "above_ema20",
+                                "ema20_value",
+                                "close_vs_ema20_pct",
+                                "above_ema50",
+                                "ema50_value",
+                                "close_vs_ema50_pct",
+                                "above_ema200",
+                                "ema200_value",
+                                "close_vs_ema200_pct",
+                                "new_high",
+                                "high_date",
+                                "high_last",
+                                "prev_high_max",
+                                "high_breakout_pct",
+                                "new_low",
+                                "low_date",
+                                "low_last",
+                                "prev_low_min",
+                                "low_breakout_pct",
+                            ]
+
+                        for c in show_cols:
+                            if c not in df_show.columns:
+                                df_show[c] = pd.NA
+                        df_show = df_show[show_cols]
+                        st.dataframe(
+                            df_show,
+                            use_container_width=True,
+                            column_config={
+                                **base_number_cols,
+                            },
+                            hide_index=True,
+                        )
+
         with st.expander(_t("snapshot_3m", lang=lang), expanded=False):
             if three_month_high_df is None or not isinstance(three_month_high_df, pd.DataFrame) or three_month_high_df.empty:
                 st.info(
